@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "History Auto Cleaner",
+  "version": "1.0",
+  "description": "自动删除指定域名的浏览历史记录，保护隐私",
+  
+  "permissions": [
+    "history",
+    "storage",
+    "tabs",
+    "webNavigation"
+  ],
+  
+  "host_permissions": [
+    "*://*/*"
+  ],
+  
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "自动清理浏览记录"
+  },
+  
+  "options_page": "options.html"
+} 
