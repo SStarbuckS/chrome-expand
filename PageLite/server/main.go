@@ -4,11 +4,13 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,13 +20,15 @@ import (
 )
 
 const (
-	dataDir = "./data"
+	dataDir           = "./data"
+	multipartOverhead = 1 * 1024 * 1024 // 为表单内容预留 1MiB
 )
 
 var (
-	username    string
-	password    string
-	maxFileSize int64 = 50 * 1024 * 1024 // 默认 50MB
+	username        string
+	password        string
+	maxFileSize     int64 = 50 * 1024 * 1024 // 默认 50MB
+	hiddenIndexDirs map[string]bool
 )
 
 type UploadResponse struct {
@@ -40,6 +44,14 @@ func main() {
 
 	if username == "" || password == "" {
 		log.Fatalf("必须设置环境变量 USER 和 PASS")
+	}
+
+	// 读取首页隐藏目录 (逗号分隔)
+	hiddenIndexDirs = make(map[string]bool)
+	for _, name := range strings.Split(os.Getenv("HIDDEN_DIRS"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			hiddenIndexDirs[name] = true
+		}
 	}
 
 	// 读取最大上传限制 (单位: MB)
@@ -101,9 +113,14 @@ func basicAuth(handler http.HandlerFunc) http.HandlerFunc {
 		}
 
 		credentials := strings.SplitN(string(decoded), ":", 2)
+		if len(credentials) != 2 {
+			http.Error(w, "无效的认证信息", http.StatusUnauthorized)
+			return
+		}
+
 		usernameMatch := subtle.ConstantTimeCompare([]byte(credentials[0]), []byte(username)) == 1
 		passwordMatch := subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(password)) == 1
-		if len(credentials) != 2 || !usernameMatch || !passwordMatch {
+		if !usernameMatch || !passwordMatch {
 			http.Error(w, "用户名或密码错误", http.StatusUnauthorized)
 			return
 		}
@@ -119,18 +136,24 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 限制请求大小
-	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
+	// 限制请求总大小，为表单内容预留空间
+	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize+multipartOverhead)
 
 	// 解析 multipart form
 	if err := r.ParseMultipartForm(maxFileSize); err != nil {
 		log.Printf("解析表单失败: %v", err)
-		respondJSON(w, http.StatusBadRequest, UploadResponse{
+		status := http.StatusBadRequest
+		var sizeErr *http.MaxBytesError
+		if errors.As(err, &sizeErr) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		respondJSON(w, status, UploadResponse{
 			Success: false,
 			Message: "解析表单失败: " + err.Error(),
 		})
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 
 	// 获取文件
 	file, header, err := r.FormFile("file")
@@ -143,6 +166,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+
+	if header.Size > maxFileSize {
+		respondJSON(w, http.StatusRequestEntityTooLarge, UploadResponse{
+			Success: false,
+			Message: "文件大小超过上传限制",
+		})
+		return
+	}
 
 	// 记录日志
 	log.Printf("接收上传: %s", header.Filename)
@@ -224,9 +255,8 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		dirPath := filepath.Join(dataDir, subPath)
 
 		// 路径遍历保护
-		absDataDir, _ := filepath.Abs(dataDir)
-		absDirPath, _ := filepath.Abs(dirPath)
-		if !strings.HasPrefix(absDirPath, absDataDir) {
+		relDirPath, err := filepath.Rel(dataDir, dirPath)
+		if err != nil || !filepath.IsLocal(relDirPath) {
 			http.NotFound(w, r)
 			return
 		}
@@ -280,7 +310,7 @@ func generateAllFilesIndex(w http.ResponseWriter) error {
 
 	// 扫描所有年份目录
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || hiddenIndexDirs[entry.Name()] {
 			continue
 		}
 
@@ -316,7 +346,7 @@ func generateAllFilesIndex(w http.ResponseWriter) error {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	tmpl := template.Must(template.New("allFiles").Parse(allFilesTemplate))
+	tmpl := template.Must(template.New("allFiles").Funcs(template.FuncMap{"pathEscape": url.PathEscape}).Parse(allFilesTemplate))
 	data := map[string]interface{}{
 		"Files":     allFiles,
 		"Count":     len(allFiles),
@@ -348,6 +378,10 @@ func generateDirIndex(w http.ResponseWriter, subPath string, urlPath string) err
 	var items []Entry
 
 	for _, entry := range entries {
+		if subPath == "" && entry.IsDir() && hiddenIndexDirs[entry.Name()] {
+			continue
+		}
+
 		info, err := entry.Info()
 		if err != nil {
 			continue
@@ -379,7 +413,7 @@ func generateDirIndex(w http.ResponseWriter, subPath string, urlPath string) err
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	tmpl := template.Must(template.New("dirIndex").Parse(dirIndexTemplate))
+	tmpl := template.Must(template.New("dirIndex").Funcs(template.FuncMap{"pathEscape": url.PathEscape}).Parse(dirIndexTemplate))
 	data := map[string]interface{}{
 		"Path":      urlPath,
 		"Items":     items,
@@ -532,9 +566,9 @@ const dirIndexTemplate = `<!DOCTYPE html>
       <tr>
         <td class="name">
           {{if .IsDir}}
-          <a href="{{.Name}}/">{{.Name}}/</a>
+          <a href="./{{pathEscape .Name}}/">{{.Name}}/</a>
           {{else}}
-          <a href="{{.Name}}" target="_blank">{{.Name}}</a>
+          <a href="./{{pathEscape .Name}}" target="_blank">{{.Name}}</a>
           {{end}}
         </td>
         <td class="date">{{.ModTime.Format "2006-01-02 15:04"}}</td>
@@ -581,7 +615,7 @@ const allFilesTemplate = `<!DOCTYPE html>
       </tr>
       {{range .Files}}
       <tr>
-        <td class="name"><a href="/{{.Year}}/{{.Name}}" target="_blank">{{.Name}}</a></td>
+        <td class="name"><a href="/{{pathEscape .Year}}/{{pathEscape .Name}}" target="_blank">{{.Name}}</a></td>
         <td class="date">{{.ModTime.Format "2006-01-02 15:04"}}</td>
         <td class="size">{{.Size}}</td>
       </tr>

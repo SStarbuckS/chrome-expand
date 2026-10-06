@@ -9,6 +9,7 @@ services:
       - USER=admin
       - PASS=admin
       - MAX_UPLOAD_MB=50
+      - HIDDEN_DIRS=tool
     volumes:
       - ./data:/app/data
  
